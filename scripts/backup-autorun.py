@@ -78,7 +78,8 @@ class backup_autorun(object):
 
 		self.__ip_info()
 
-		self.__default_backup()
+		# Default backup disabled - uncomment the line below to enable
+		# self.__default_backup()
 
 		# check for updates
 		gitObj	= lib_git.git()

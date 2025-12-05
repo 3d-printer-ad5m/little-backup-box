@@ -69,7 +69,7 @@ from luma.core.interface.serial import i2c, spi, pcf8574
 from luma.core.interface.parallel import bitbang_6800
 from luma.core.render import canvas
 from luma.oled.device import ssd1306, ssd1309, ssd1322, ssd1331, sh1106
-from luma.lcd.device import st7735
+from luma.lcd.device import st7735, st7789
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -90,8 +90,14 @@ class DISPLAY(object):
 
 		self.loop_continue	= True
 
-		# cleanup pins
-		GPIO.cleanup()
+		# Cleanup GPIO state before initialization (helps with lgpio allocation)
+		# Note: This is safe because luma.lcd uses lgpio, not RPi.GPIO
+		try:
+			GPIO.setmode(GPIO.BCM)
+			GPIO.setwarnings(False)
+			GPIO.cleanup()
+		except:
+			pass
 
 		# objects
 		self.__setup							= lib_setup.setup()
@@ -163,6 +169,7 @@ class DISPLAY(object):
 				self.color_bg		= (*self.color_bg, 255)
 
 		self.hardware_ready	= True
+		serial = None
 
 		try:
 			if self.__conf_DISP_CONNECTION == 'I2C':
@@ -172,17 +179,43 @@ class DISPLAY(object):
 					serial = spi(port=self.__conf_DISP_SPI_PORT, device=0, bus_speed_hz=40000000)
 				elif self.__conf_DISP_DRIVER == 'ST7735 WAVESHARE LCD display HAT':
 					serial = spi(port=self.__conf_DISP_SPI_PORT, device=0, bus_speed_hz=40000000, gpio_DC=25, gpio_RST=27)
+				elif self.__conf_DISP_DRIVER == 'ST7789':
+					serial = spi(port=self.__conf_DISP_SPI_PORT, device=0, bus_speed_hz=40000000)
+				elif self.__conf_DISP_DRIVER == 'ST7789 WAVESHARE':
+					# Use DC and RST pins for Waveshare HAT
+					# Note: luma uses lgpio internally, ensure no GPIO conflicts
+					# Try multiple times as GPIO allocation can be flaky
+					serial = None
+					for attempt in range(3):
+						try:
+							serial = spi(port=self.__conf_DISP_SPI_PORT, device=0, bus_speed_hz=40000000, gpio_DC=25, gpio_RST=27)
+							break
+						except Exception as gpio_err:
+							if attempt < 2:
+								time.sleep(0.5)  # Wait before retry
+								continue
+							# Last attempt failed, try without explicit GPIO pins
+							print(f'Warning: GPIO pins allocation failed after {attempt+1} attempts: {gpio_err}', file=sys.stderr)
+							try:
+								serial = spi(port=self.__conf_DISP_SPI_PORT, device=0, bus_speed_hz=40000000)
+								print('Warning: Using SPI without explicit GPIO pins - display may not work correctly', file=sys.stderr)
+								break
+							except Exception as e2:
+								raise Exception(f'SPI initialization failed: {gpio_err}, fallback also failed: {e2}')
 				else:
 					serial = spi(port=self.__conf_DISP_SPI_PORT, device=0)
 			else:
 				print('Error: No valid connection type for display',file=sys.stderr)
 				if self.__conf_DISP_DRIVER != 'none':
 					raise Exception('Error: No valid connection type for display')
-		except:
+		except Exception as e:
 			self.hardware_ready	= False
-			print(f'Display connection to {self.__conf_DISP_CONNECTION} could not be enabled.', file=sys.stderr)
+			serial = None
+			print(f'Display connection to {self.__conf_DISP_CONNECTION} could not be enabled: {e}', file=sys.stderr)
 
 		try:
+			if serial is None:
+				raise Exception('Serial interface not initialized')
 			if self.__conf_DISP_DRIVER == 'none':
 				self.device	= self.__display_dummy()
 				self.hardware_ready	= False
@@ -202,14 +235,27 @@ class DISPLAY(object):
 			elif self.__conf_DISP_DRIVER == 'ST7735 WAVESHARE LCD display HAT':
 				self.device	= st7735(serial_interface=serial, h_offset=self.__conf_DISP_OFFSET_X, v_offset=self.__conf_DISP_OFFSET_Y, gpio_LIGHT=(self.__conf_DISP_BACKLIGHT_PIN if self.__conf_DISP_BACKLIGHT_PIN > 0 else 18), bgr=self.__conf_DISP_COLOR_BGR, inverse=self.__conf_DISP_COLOR_INVERSE) # pin: GPIO Backlight
 				self.device.backlight(self.__conf_DISP_BACKLIGHT_ENABLED)
+			elif self.__conf_DISP_DRIVER == 'ST7789':
+				self.device	= st7789(serial_interface=serial, width=self.__conf_DISP_RESOLUTION_X, height=self.__conf_DISP_RESOLUTION_Y, h_offset=self.__conf_DISP_OFFSET_X, v_offset=self.__conf_DISP_OFFSET_Y, gpio_LIGHT=(self.__conf_DISP_BACKLIGHT_PIN if self.__conf_DISP_BACKLIGHT_PIN > 0 else 18), bgr=self.__conf_DISP_COLOR_BGR, inverse=self.__conf_DISP_COLOR_INVERSE) # pin: GPIO Backlight
+				self.device.backlight(self.__conf_DISP_BACKLIGHT_ENABLED)
+			elif self.__conf_DISP_DRIVER == 'ST7789 WAVESHARE':
+				self.device	= st7789(serial_interface=serial, width=self.__conf_DISP_RESOLUTION_X, height=self.__conf_DISP_RESOLUTION_Y, h_offset=self.__conf_DISP_OFFSET_X, v_offset=self.__conf_DISP_OFFSET_Y, gpio_LIGHT=(self.__conf_DISP_BACKLIGHT_PIN if self.__conf_DISP_BACKLIGHT_PIN > 0 else 18), bgr=self.__conf_DISP_COLOR_BGR, inverse=self.__conf_DISP_COLOR_INVERSE) # pin: GPIO Backlight
+				self.device.backlight(self.__conf_DISP_BACKLIGHT_ENABLED)
 			else:
 				print('Error: No valid display driver', file=sys.stderr)
-		except:
+				self.device	= self.__display_dummy()
+				self.hardware_ready	= False
+		except Exception as e:
 			self.hardware_ready	= False
-			print(f'Display driver {self.__conf_DISP_DRIVER} could not be enabled.', file=sys.stderr)
+			self.device	= self.__display_dummy()
+			print(f'Display driver {self.__conf_DISP_DRIVER} could not be enabled: {e}', file=sys.stderr)
 
 		if self.hardware_ready:
-			self.device.capabilities(width=self.__conf_DISP_RESOLUTION_X, height=self.__conf_DISP_RESOLUTION_Y, rotate=self.__conf_DISP_ROTATE, mode=self.__conf_DISP_COLOR_MODEL)
+			# For ST7789, width and height are set in constructor, so only set rotate and mode
+			if self.__conf_DISP_DRIVER in ['ST7789', 'ST7789 WAVESHARE']:
+				self.device.capabilities(width=self.__conf_DISP_RESOLUTION_X, height=self.__conf_DISP_RESOLUTION_Y, rotate=self.__conf_DISP_ROTATE, mode=self.__conf_DISP_COLOR_MODEL)
+			else:
+				self.device.capabilities(width=self.__conf_DISP_RESOLUTION_X, height=self.__conf_DISP_RESOLUTION_Y, rotate=self.__conf_DISP_ROTATE, mode=self.__conf_DISP_COLOR_MODEL)
 
 			self.device.contrast(self.__conf_DISP_CONTRAST)
 
@@ -218,8 +264,13 @@ class DISPLAY(object):
 		# define font
 		self.FONT = ImageFont.truetype(self.__const_FONT_PATH, self.__conf_DISP_FONT_SIZE)
 
-		# calculate line dimensions
-		self.calculate_LineSize()
+		# calculate line dimensions (only if hardware is ready)
+		if self.hardware_ready:
+			self.calculate_LineSize()
+		else:
+			# Set default values if hardware not ready
+			self.line_height = 12
+			self.maxLines = 5
 
 		# prepare statusbar
 		if self.__conf_DISP_SHOW_STATUSBAR:
